@@ -8,6 +8,7 @@ from coldstore.ammonia import validate_ppm, validate_threshold
 from coldstore.comp import validate_stage
 from coldstore.evap import validate_baseline
 from coldstore.fan import PRIMARY, STANDBY
+from coldstore.failover import Policy, save_policy
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
@@ -423,8 +424,12 @@ def fan_switch(server: "Server", request: Request) -> Response:
 
 def fan_fail(server: "Server", request: Request) -> Response:
     fan_id = request.str_field("id")
+    group = request.str_field("group", "cold")
     _fan_set(server, request).fail(fan_id)
-    return json_response({"failed": fan_id})
+    payload: dict[str, object] = {"failed": fan_id}
+    if group == "cold":
+        payload["failover"] = server.runtime.failover.notify_fault(fan_id).as_dict()
+    return json_response(payload)
 
 
 def fan_repair(server: "Server", request: Request) -> Response:
@@ -443,6 +448,64 @@ def fan_faults(server: "Server", request: Request) -> Response:
             "count": fans.count(),
         }
     )
+
+
+def fan_failover_state(server: "Server", request: Request) -> Response:
+    failover = server.runtime.failover
+    payload = failover.state().as_dict()
+    payload["last_switch"] = failover.last_switch()
+    return json_response(payload)
+
+
+def fan_failover_switch(server: "Server", request: Request) -> Response:
+    result = server.runtime.failover.request_switch(request.str_field("id"))
+    return json_response(result.as_dict())
+
+
+def fan_failover_confirm(server: "Server", request: Request) -> Response:
+    ok = request.str_field("ok", "true").lower() not in ("false", "0", "no")
+    return json_response(server.runtime.failover.confirm_airflow(ok).as_dict())
+
+
+def fan_failover_failback(server: "Server", request: Request) -> Response:
+    force = request.str_field("force", "").lower() in ("true", "1", "yes")
+    hour = request.int_field("hour", -1)
+    result = server.runtime.failover.failback(force=force, hour=None if hour < 0 else hour)
+    return json_response(result.as_dict())
+
+
+def fan_failover_tick(server: "Server", request: Request) -> Response:
+    hours = request.float_field("hours")
+    return json_response({"duty_hours": server.runtime.failover.tick(hours)})
+
+
+def fan_failover_evaluate(server: "Server", request: Request) -> Response:
+    hour = request.int_field("hour", -1)
+    result = server.runtime.failover.evaluate(hour=None if hour < 0 else hour)
+    return json_response({"result": result.as_dict() if result else None})
+
+
+def fan_failover_policy(server: "Server", request: Request) -> Response:
+    failover = server.runtime.failover
+    current = failover.policy()
+    policy = Policy(
+        trigger=request.str_field("trigger", current.trigger),
+        runtime_limit_hours=request.float_field("runtime_limit_hours", current.runtime_limit_hours),
+        failback_mode=request.str_field("failback_mode", current.failback_mode),
+        window_start_hour=request.int_field("window_start_hour", current.window_start_hour),
+        window_end_hour=request.int_field("window_end_hour", current.window_end_hour),
+        confirm_mode=request.str_field("confirm_mode", current.confirm_mode),
+        confirm_timeout_seconds=request.float_field(
+            "confirm_timeout_seconds", current.confirm_timeout_seconds
+        ),
+    )
+    save_policy(server.runtime.store, policy)
+    return json_response(failover.policy().as_dict())
+
+
+def fan_failover_history(server: "Server", request: Request) -> Response:
+    entries = server.runtime.failover.history()
+    return json_response({"entries": entries, "count": len(entries)})
 
 
 def evap_state(server: "Server", request: Request) -> Response:

@@ -21,6 +21,7 @@ def collect(rt: Runtime) -> dict[str, object]:
         "ammonia": rt.ammonia.state().as_dict(),
         "interlock": rt.interlock.state().as_dict(),
         "cold_fans": rt.cold_fans.state().as_dict(),
+        "failover": rt.failover.state().as_dict(),
         "evap": rt.evap.state().as_dict(),
         "defrost": rt.defrost.state().as_dict(),
         "load": rt.load.state(rt.rooms).as_dict(),

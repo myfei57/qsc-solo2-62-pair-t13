@@ -13,6 +13,7 @@ from coldstore.comp import validate_stage
 from coldstore.defrost import Controller as DefrostController
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
 from coldstore.fan import PRIMARY, STANDBY, FanSet
+from coldstore.failover import FailoverManager, Policy, save_policy
 from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator, compute_load, validate_baseline
 from coldstore.ns import Stage, control_line
@@ -235,6 +236,208 @@ class FanCase(unittest.TestCase):
             fans.fail("missing")
         self.assertEqual(fans.fan("missing"), None)
         self.assertEqual(fans.primary(), "")
+
+
+class FailoverCase(unittest.TestCase):
+    def _manager(self, tmp: str, defrosting: bool = False):
+        store = Store.open(f"{tmp}/state.json")
+        fans = FanSet()
+        fans.add_fan("f1", PRIMARY)
+        fans.add_fan("f2", STANDBY)
+        fans.start("f1")
+        rooms = RoomRegistry()
+        rooms.add_room("r1", 1)
+        rooms.set_defrosting("r1", defrosting)
+        auditor = Auditor(store)
+        return store, fans, rooms, FailoverManager(fans, rooms, store, auditor), auditor
+
+    def test_runtime_rotation_switches_and_audits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, _, failover, auditor = self._manager(tmp)
+            self.assertEqual(failover.tick(100.0), 100.0)
+            self.assertFalse(failover.rotation_due())
+            save_policy(store, Policy(**{**failover.policy().as_dict(), "runtime_limit_hours": 120.0}))
+            failover.tick(30.0)
+            self.assertTrue(failover.rotation_due())
+
+            result = failover.evaluate(now=1_000.0)
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(result.from_fan, "f1")
+            self.assertEqual(result.to_fan, "f2")
+            self.assertEqual(fans.primary(), "f2")
+            self.assertEqual(fans.active(), "f2")
+            self.assertEqual(fans.fan("f1").running, False)
+            self.assertEqual(failover.duty_hours(), 0.0)
+            self.assertEqual(failover.runtime_hours("f1"), 130.0)
+            kinds = auditor.count_by_kind()
+            self.assertEqual(kinds["fan.failover.switch"], 1)
+            self.assertEqual(kinds["fan.airflow.confirm"], 1)
+            self.assertIn("primary=f2", failover.describe())
+
+    def test_fault_fails_over_immediately_and_marks_failback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, fans, _, failover, _ = self._manager(tmp)
+            fans.fail("f1")
+            result = failover.notify_fault("f1", now=2_000.0)
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(result.reason, "fault")
+            self.assertEqual(fans.active(), "f2")
+            self.assertEqual(failover.failback_target(), "f1")
+            self.assertEqual(failover.state().failback_target, "f1")
+
+    def test_defrost_defers_automatic_switch_until_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, fans, rooms, failover, _ = self._manager(tmp, defrosting=True)
+            fans.fail("f1")
+            result = failover.notify_fault("f1")
+            self.assertEqual(result.status, "deferred")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertEqual(failover.state().pending, "f2")
+            self.assertEqual(failover.evaluate(), None)
+
+            rooms.set_defrosting("r1", False)
+            result = failover.evaluate(now=3_000.0)
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(fans.primary(), "f2")
+            self.assertEqual(failover.state().pending, "")
+
+    def test_manual_switch_rejected_during_defrost(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, fans, _, failover, _ = self._manager(tmp, defrosting=True)
+            result = failover.request_switch("f2")
+            self.assertEqual(result.status, "rejected")
+            self.assertIn("defrost", result.detail)
+            self.assertEqual(fans.primary(), "f1")
+
+    def test_concurrent_preemption_is_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, fans, _, failover, _ = self._manager(tmp)
+            failover._switch_lock.acquire()
+            try:
+                result = failover.request_switch("f2")
+            finally:
+                failover._switch_lock.release()
+            self.assertEqual(result.status, "rejected")
+            self.assertEqual(result.detail, "switch in progress")
+            self.assertEqual(fans.primary(), "f1")
+
+            result = failover.request_switch("f2")
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(fans.primary(), "f2")
+            self.assertGreater(failover.epoch(), 0)
+
+    def test_manual_confirm_mode_rolls_back_on_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, _, failover, auditor = self._manager(tmp)
+            save_policy(store, Policy(**{**failover.policy().as_dict(), "confirm_mode": "manual"}))
+            result = failover.request_switch("f2", now=100.0)
+            self.assertEqual(result.status, "confirming")
+            self.assertEqual(failover.state().confirming, "f2")
+            self.assertTrue(fans.fan("f1").running)
+
+            self.assertEqual(failover.evaluate(now=100.0), None)
+            result = failover.evaluate(now=1_000.0)
+            self.assertEqual(result.status, "rolled-back")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertEqual(fans.active(), "f1")
+            self.assertFalse(fans.fan("f2").running)
+            self.assertEqual(auditor.count_by_kind()["fan.failover.rollback"], 1)
+
+    def test_manual_confirm_commit_and_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, _, failover, _ = self._manager(tmp)
+            save_policy(store, Policy(**{**failover.policy().as_dict(), "confirm_mode": "manual"}))
+            failover.request_switch("f2", now=100.0)
+            result = failover.confirm_airflow(True, now=120.0)
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(fans.active(), "f2")
+            self.assertFalse(fans.fan("f1").running)
+
+            result = failover.request_switch("f1", now=200.0)
+            self.assertEqual(result.status, "confirming")
+            result = failover.confirm_airflow(False, now=210.0)
+            self.assertEqual(result.status, "rolled-back")
+            self.assertEqual(fans.active(), "f2")
+
+    def test_rollback_restores_primary_when_target_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, _, failover, auditor = self._manager(tmp)
+            save_policy(store, Policy(**{**failover.policy().as_dict(), "confirm_mode": "manual"}))
+            failover.request_switch("f2", now=100.0)
+            fans.fail("f2")
+            result = failover.confirm_airflow(True, now=110.0)
+            self.assertEqual(result.status, "rolled-back")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertEqual(fans.active(), "f1")
+            self.assertEqual(auditor.count_by_kind()["fan.failover.rollback"], 1)
+
+    def test_failback_waits_for_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, fans, _, failover, _ = self._manager(tmp)
+            fans.fail("f1")
+            failover.notify_fault("f1", now=1_000.0)
+            fans.repair("f1")
+            self.assertEqual(fans.fan("f1").role, STANDBY)
+
+            result = failover.failback(hour=12)
+            self.assertEqual(result.status, "rejected")
+            self.assertIn("window", result.detail)
+            self.assertEqual(fans.primary(), "f2")
+
+            result = failover.failback(hour=3, now=5_000.0)
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertEqual(failover.failback_target(), "")
+
+    def test_failback_force_and_evaluate_in_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, fans, _, failover, _ = self._manager(tmp)
+            fans.fail("f1")
+            failover.notify_fault("f1", now=1_000.0)
+            fans.repair("f1")
+            result = failover.failback(force=True, now=6_000.0)
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(fans.primary(), "f1")
+
+            fans.fail("f1")
+            failover.notify_fault("f1", now=7_000.0)
+            fans.repair("f1")
+            result = failover.evaluate(hour=3, now=8_000.0)
+            self.assertEqual(result.status, "switched")
+            self.assertEqual(result.reason, "failback")
+            self.assertEqual(fans.primary(), "f1")
+
+    def test_policy_defaults_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, failover, _ = self._manager(tmp)
+            policy = failover.policy()
+            self.assertEqual(policy.trigger, "runtime")
+            self.assertEqual(policy.runtime_limit_hours, 720.0)
+            self.assertEqual(policy.failback_mode, "window")
+            self.assertEqual((policy.window_start_hour, policy.window_end_hour), (2, 4))
+            self.assertTrue(policy.in_window(2))
+            self.assertTrue(policy.in_window(3))
+            self.assertFalse(policy.in_window(4))
+            self.assertFalse(policy.in_window(12))
+
+            with self.assertRaises(ValueError):
+                save_policy(Store.open(f"{tmp}/s2.json"), Policy(**{**policy.as_dict(), "trigger": "faults"}))
+            with self.assertRaises(ValueError):
+                save_policy(Store.open(f"{tmp}/s3.json"), Policy(**{**policy.as_dict(), "window_start_hour": 24}))
+            with self.assertRaises(ValueError):
+                failover.tick(0.0)
+
+    def test_history_collects_switch_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, failover, _ = self._manager(tmp)
+            failover.request_switch("f2", now=1_000.0)
+            failover.request_switch("f1", now=2_000.0)
+            history = failover.history()
+            kinds = [entry["kind"] for entry in history]
+            self.assertEqual(kinds.count("fan.failover.switch"), 2)
+            self.assertIn("fan.failover.attempt", kinds)
+            self.assertIn("fan.airflow.confirm", kinds)
+            self.assertEqual(failover.state().epoch, failover.epoch())
 
 
 class CondenserCase(unittest.TestCase):

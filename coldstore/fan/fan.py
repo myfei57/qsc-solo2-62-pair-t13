@@ -97,6 +97,12 @@ class FanSet:
             unit.role = PRIMARY
             return unit.id
 
+    def demote(self, fan_id: str) -> None:
+        """Park one fan on standby, used when a rollback cannot restore duty."""
+
+        with self._lock:
+            self._require(fan_id).role = STANDBY
+
     def primary(self) -> str:
         with self._lock:
             for fan_id, unit in self._fans.items():

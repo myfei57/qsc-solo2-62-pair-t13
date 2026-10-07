@@ -21,6 +21,7 @@ def collect(rt: Runtime) -> dict[str, str]:
         "ammonia": rt.ammonia.describe(),
         "interlock": rt.interlock.describe(),
         "cold_fans": rt.cold_fans.describe(),
+        "failover": rt.failover.describe(),
         "evap": rt.evap.describe(),
         "defrost": rt.defrost.describe(),
         "load": rt.load.describe(rt.rooms),

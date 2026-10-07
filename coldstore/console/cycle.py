@@ -44,6 +44,8 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
         elif room_id:
             rt.defrost.finish(room_id)
 
+    rt.failover.evaluate()
+
     quota_value = rt.accumulator.add(amount)
     rt.auditor.record("cycle", f"{temp:.4f}")
 
@@ -57,6 +59,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "stage": rt.compressors.stage(comp_id)[0] if comp_id else 0,
             "supply_open": rt.supply.is_open(comp_id) if comp_id else False,
             "defrosting": rt.defrost.defrosting(),
+            "fan_primary": rt.cold_fans.primary(),
             "quota": quota_value,
             "cooling_load": rt.load.load_for(temp),
             "audit_count": rt.auditor.count(),

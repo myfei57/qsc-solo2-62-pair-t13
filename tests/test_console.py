@@ -61,6 +61,7 @@ class ConsoleCase(unittest.TestCase):
                 "ammonia",
                 "interlock",
                 "cold_fans",
+                "failover",
                 "evap",
                 "defrost",
                 "load",
@@ -257,6 +258,83 @@ class ConsoleCase(unittest.TestCase):
         self.assertTrue(body["above_baseline"])
         status, body = self.call("POST", "/evap/switch", {"id": "e1"})
         self.assertEqual(body["duty"], "e1")
+
+    def test_fan_failover_routes(self) -> None:
+        self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
+        self.call("POST", "/fan/add", {"id": "f2", "role": "standby"})
+        self.call("POST", "/fan/start", {"id": "f1"})
+
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["primary"], "f1")
+        self.assertEqual(body["active"], "f1")
+        self.assertEqual(body["policy"]["trigger"], "runtime")
+        self.assertEqual(body["policy"]["failback_mode"], "window")
+        self.assertFalse(body["rotation_due"])
+
+        status, body = self.call("POST", "/fan/failover/tick", {"hours": 10.0})
+        self.assertEqual(body["duty_hours"], 10.0)
+
+        status, body = self.call("POST", "/fan/failover/switch", {"id": "f2"})
+        self.assertEqual(body["status"], "switched")
+        self.assertEqual(body["from"], "f1")
+        self.assertEqual(body["to"], "f2")
+
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(body["primary"], "f2")
+        self.assertEqual(body["active"], "f2")
+        self.assertEqual(body["duty_hours"], 0.0)
+        self.assertTrue(body["last_switch"])
+
+        status, body = self.call("GET", "/fan/failover/history")
+        kinds = [entry["kind"] for entry in body["entries"]]
+        self.assertIn("fan.failover.switch", kinds)
+        self.assertIn("fan.airflow.confirm", kinds)
+
+        status, body = self.call("POST", "/fan/fail", {"id": "f2"})
+        self.assertEqual(body["failover"]["status"], "switched")
+        self.assertEqual(body["failover"]["reason"], "fault")
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(body["primary"], "f1")
+        self.assertEqual(body["failback_target"], "f2")
+
+        self.call("POST", "/fan/repair", {"id": "f2"})
+        status, body = self.call("POST", "/fan/failover/failback", {"hour": 12})
+        self.assertEqual(body["status"], "rejected")
+        status, body = self.call("POST", "/fan/failover/failback", {"force": "true"})
+        self.assertEqual(body["status"], "switched")
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(body["primary"], "f2")
+        self.assertEqual(body["failback_target"], "")
+
+        status, body = self.call(
+            "POST",
+            "/fan/failover/policy",
+            {"runtime_limit_hours": 100.0, "window_start_hour": 1, "window_end_hour": 5},
+        )
+        self.assertEqual(body["runtime_limit_hours"], 100.0)
+        self.assertEqual(body["window_start_hour"], 1)
+        status, error = self.call("POST", "/fan/failover/policy", {"trigger": "faults"})
+        self.assertEqual(status, 400)
+        self.assertIn("trigger", error["error"])
+
+        status, body = self.call("POST", "/fan/failover/evaluate", {"hour": 3})
+        self.assertEqual(status, 200)
+        self.assertIn("result", body)
+
+    def test_defrost_blocks_manual_failover_switch(self) -> None:
+        self.add_room("r1", 1, -10.0)
+        self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
+        self.call("POST", "/fan/add", {"id": "f2", "role": "standby"})
+        self.call("POST", "/fan/start", {"id": "f1"})
+        self.call("POST", "/defrost/start", {"id": "r1"})
+
+        status, body = self.call("POST", "/fan/failover/switch", {"id": "f2"})
+        self.assertEqual(body["status"], "rejected")
+        self.assertIn("defrost", body["detail"])
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(body["primary"], "f1")
+        self.assertTrue(body["defrosting"])
 
     def test_defrost_routes(self) -> None:
         self.add_room("r1", 1, -10.0)
