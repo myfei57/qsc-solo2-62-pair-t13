@@ -30,6 +30,9 @@ class Telemetry:
     interlock_trips: int
     cold_primary: str
     cold_running: int
+    failover_pending: str
+    failover_deferred: str
+    failover_switching: bool
     evap_temperature: float
     evap_above: bool
     defrost_warmups: int
@@ -59,6 +62,9 @@ class Telemetry:
             "interlock_trips": self.interlock_trips,
             "cold_primary": self.cold_primary,
             "cold_running": self.cold_running,
+            "failover_pending": self.failover_pending,
+            "failover_deferred": self.failover_deferred,
+            "failover_switching": self.failover_switching,
             "evap_temperature": self.evap_temperature,
             "evap_above": self.evap_above,
             "defrost_warmups": self.defrost_warmups,
@@ -94,6 +100,9 @@ def collect(rt: Runtime) -> Telemetry:
         interlock_trips=rt.interlock.count(),
         cold_primary=rt.cold_fans.primary(),
         cold_running=len(rt.cold_fans.running_ids()),
+        failover_pending=rt.failover.pending_failback(),
+        failover_deferred=rt.failover.deferred(),
+        failover_switching=rt.failover.state().switching,
         evap_temperature=rt.evap.temperature(),
         evap_above=rt.evap.above_baseline(),
         defrost_warmups=rt.defrost.warmup_count(),

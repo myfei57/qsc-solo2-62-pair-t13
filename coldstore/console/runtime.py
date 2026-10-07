@@ -7,6 +7,7 @@ from coldstore.audit import Auditor
 from coldstore.comp import Bank
 from coldstore.defrost import Controller
 from coldstore.evap import Condenser
+from coldstore.failover import FailoverManager
 from coldstore.fan import FanSet
 from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator
@@ -39,4 +40,5 @@ class Runtime:
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.failover = FailoverManager(cold_fans, rooms, store, self.auditor)
         self.scheduler = Scheduler(store)

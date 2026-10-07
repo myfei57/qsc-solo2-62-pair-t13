@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
+import threading
+import time
 import unittest
 
 from coldstore.ammonia import Monitor, level_for, validate_ppm
@@ -12,6 +15,7 @@ from coldstore.comp import Bank as CompressorBank
 from coldstore.comp import validate_stage
 from coldstore.defrost import Controller as DefrostController
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
+from coldstore.failover import FailoverManager
 from coldstore.fan import PRIMARY, STANDBY, FanSet
 from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator, compute_load, validate_baseline
@@ -235,6 +239,196 @@ class FanCase(unittest.TestCase):
             fans.fail("missing")
         self.assertEqual(fans.fan("missing"), None)
         self.assertEqual(fans.primary(), "")
+
+
+def _at_hour(hour: int) -> float:
+    """A timestamp whose local hour matches, whatever the test host zone."""
+
+    base = 1_700_000_000.0
+    shift = (hour - time.localtime(base).tm_hour) % 24
+    return base + shift * 3600
+
+
+class FailoverCase(unittest.TestCase):
+    def _manager(self, tmp: str, confirmer=None, clock=None):
+        store = Store.open(f"{tmp}/state.json")
+        fans = FanSet()
+        fans.add_fan("f1", PRIMARY)
+        fans.add_fan("f2", STANDBY)
+        rooms = RoomRegistry()
+        rooms.add_room("r1", 1)
+        auditor = Auditor(store)
+        manager = FailoverManager(
+            fans,
+            rooms,
+            store,
+            auditor,
+            clock=clock or (lambda: 1_700_000_000.0),
+            confirmer=confirmer,
+        )
+        return fans, rooms, auditor, manager
+
+    def test_fault_fails_over_and_audits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fans, _, auditor, manager = self._manager(tmp)
+            fans.start("f1")
+            fans.fail("f1")
+            outcome = manager.on_fault("f1")
+            self.assertEqual(outcome.status, "switched")
+            self.assertEqual(outcome.reason, "fault")
+            self.assertEqual(outcome.origin, "f1")
+            self.assertEqual(fans.primary(), "f2")
+            self.assertTrue(fans.fan("f2").running)
+            self.assertEqual(manager.pending_failback(), "f1")
+            self.assertEqual(manager.fault_count("f1"), 1)
+            self.assertIn("fan_airflow", auditor.kinds())
+            switch = json.loads(auditor.filter("fan_switch")[-1].detail)
+            self.assertEqual(switch["from"], "f1")
+            self.assertEqual(switch["to"], "f2")
+            self.assertEqual(switch["reason"], "fault")
+            self.assertEqual(switch["primary"], "f2")
+            self.assertEqual(switch["standby"], ["f1"])
+
+    def test_runtime_rotation_alternates_duty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fans, _, _, manager = self._manager(tmp)
+            fans.start("f1")
+            outcome = manager.tick(800.0)
+            self.assertEqual(outcome.status, "switched")
+            self.assertEqual(outcome.reason, "rotate")
+            self.assertEqual(fans.primary(), "f2")
+            self.assertEqual(manager.stretch(), 0.0)
+            self.assertEqual(manager.runtime_hours("f1"), 800.0)
+            outcome = manager.tick(800.0)
+            self.assertEqual(outcome.reason, "rotate")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertEqual(manager.runtime_hours("f2"), 800.0)
+            self.assertEqual(manager.tick(1.0).status, "noop")
+
+    def test_defrost_defers_then_tick_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fans, rooms, auditor, manager = self._manager(tmp)
+            fans.start("f1")
+            rooms.set_defrosting("r1", True)
+            fans.fail("f1")
+            outcome = manager.on_fault("f1")
+            self.assertEqual(outcome.status, "deferred")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertEqual(manager.deferred(), "fault")
+            self.assertIn("fan_defer", auditor.kinds())
+            rooms.set_defrosting("r1", False)
+            outcome = manager.tick(1.0)
+            self.assertEqual(outcome.status, "switched")
+            self.assertEqual(fans.primary(), "f2")
+            self.assertEqual(manager.deferred(), "")
+
+    def test_failed_confirmation_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fans, _, auditor, manager = self._manager(
+                tmp, confirmer=lambda fans, fan_id: False
+            )
+            fans.start("f1")
+            outcome = manager.request_switch("f2")
+            self.assertEqual(outcome.status, "rolled_back")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertTrue(fans.fan("f1").running)
+            self.assertFalse(fans.fan("f2").running)
+            airflow = json.loads(auditor.filter("fan_airflow")[-1].detail)
+            self.assertFalse(airflow["confirmed"])
+            rollback = json.loads(auditor.filter("fan_rollback")[-1].detail)
+            self.assertEqual(rollback["from"], "f1")
+            self.assertEqual(rollback["to"], "f2")
+            self.assertEqual(rollback["primary"], "f1")
+
+    def test_concurrent_switches_are_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entered = threading.Event()
+            release = threading.Event()
+
+            def slow_confirmer(fans: FanSet, fan_id: str) -> bool:
+                entered.set()
+                release.wait(5)
+                return True
+
+            fans, _, _, manager = self._manager(tmp, confirmer=slow_confirmer)
+            fans.start("f1")
+            results = []
+            first = threading.Thread(
+                target=lambda: results.append(manager.request_switch("f2"))
+            )
+            first.start()
+            self.assertTrue(entered.wait(2))
+            outcome = manager.request_switch("f2")
+            self.assertEqual(outcome.status, "busy")
+            release.set()
+            first.join(2)
+            self.assertEqual([item.status for item in results], ["switched"])
+            self.assertEqual(fans.primary(), "f2")
+
+    def test_failback_waits_for_window_and_soak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            now = [_at_hour(3)]
+            fans, _, auditor, manager = self._manager(tmp, clock=lambda: now[0])
+            fans.start("f1")
+            fans.fail("f1")
+            manager.on_fault("f1")
+            self.assertEqual(fans.primary(), "f2")
+            fans.repair("f1")
+            manager.on_repair("f1")
+            self.assertEqual(manager.tick(1.0).status, "noop")
+            now[0] = _at_hour(3) + 25 * 3600
+            self.assertEqual(manager.tick(1.0).status, "noop")
+            now[0] = _at_hour(3) + 48 * 3600
+            outcome = manager.tick(1.0)
+            self.assertEqual(outcome.status, "switched")
+            self.assertEqual(outcome.reason, "failback")
+            self.assertEqual(fans.primary(), "f1")
+            self.assertEqual(manager.pending_failback(), "")
+            switches = [json.loads(entry.detail) for entry in auditor.filter("fan_switch")]
+            self.assertEqual(switches[-1]["reason"], "failback")
+
+    def test_refused_without_healthy_standby(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fans, _, _, manager = self._manager(tmp)
+            fans.fail("f1")
+            fans.fail("f2")
+            outcome = manager.on_fault("f1")
+            self.assertEqual(outcome.status, "refused")
+            self.assertEqual(fans.primary(), "f1")
+
+    def test_manual_switch_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fans, _, _, manager = self._manager(tmp)
+            fans.start("f1")
+            outcome = manager.request_switch("f2")
+            self.assertEqual(outcome.status, "switched")
+            self.assertEqual(fans.primary(), "f2")
+            self.assertFalse(fans.fan("f1").running)
+            with self.assertRaises(ValueError):
+                manager.request_switch("missing")
+            fans.fail("f1")
+            with self.assertRaises(ValueError):
+                manager.request_switch("f1")
+            with self.assertRaises(ValueError):
+                manager.set_window(2, 2)
+            with self.assertRaises(ValueError):
+                manager.set_window(-1, 5)
+            with self.assertRaises(ValueError):
+                manager.set_policy(0, 1.0)
+            with self.assertRaises(ValueError):
+                manager.set_policy(10.0, -1.0)
+            with self.assertRaises(ValueError):
+                manager.tick(0)
+            manager.set_window(22, 6)
+            self.assertEqual(manager.window(), (22, 6))
+            manager.set_policy(100.0, 12.0)
+            self.assertEqual(manager.rotate_hours(), 100.0)
+            self.assertEqual(manager.soak_hours(), 12.0)
+            self.assertIn("failover primary=f2", manager.describe())
+            state = manager.state()
+            self.assertEqual(state.primary, "f2")
+            self.assertEqual(state.standbys, ["f1"])
+            self.assertEqual(state.faults, {"f1": 0, "f2": 0})
 
 
 class CondenserCase(unittest.TestCase):

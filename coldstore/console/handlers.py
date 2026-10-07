@@ -418,18 +418,32 @@ def fan_stop(server: "Server", request: Request) -> Response:
 
 
 def fan_switch(server: "Server", request: Request) -> Response:
-    return json_response({"primary": _fan_set(server, request).switch_over(request.str_field("id"))})
+    fans = _fan_set(server, request)
+    fan_id = request.str_field("id")
+    if fans is server.runtime.cold_fans:
+        outcome = server.runtime.failover.request_switch(fan_id)
+        return json_response(
+            {"primary": server.runtime.cold_fans.primary(), "outcome": outcome.as_dict()}
+        )
+    return json_response({"primary": fans.switch_over(fan_id)})
 
 
 def fan_fail(server: "Server", request: Request) -> Response:
     fan_id = request.str_field("id")
-    _fan_set(server, request).fail(fan_id)
-    return json_response({"failed": fan_id})
+    fans = _fan_set(server, request)
+    fans.fail(fan_id)
+    payload: dict[str, object] = {"failed": fan_id}
+    if fans is server.runtime.cold_fans:
+        payload["failover"] = server.runtime.failover.on_fault(fan_id).as_dict()
+    return json_response(payload)
 
 
 def fan_repair(server: "Server", request: Request) -> Response:
     fan_id = request.str_field("id")
-    _fan_set(server, request).repair(fan_id)
+    fans = _fan_set(server, request)
+    fans.repair(fan_id)
+    if fans is server.runtime.cold_fans:
+        server.runtime.failover.on_repair(fan_id)
     return json_response({"repaired": fan_id})
 
 
@@ -443,6 +457,41 @@ def fan_faults(server: "Server", request: Request) -> Response:
             "count": fans.count(),
         }
     )
+
+
+def failover_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.failover.state().as_dict())
+
+
+def failover_tick(server: "Server", request: Request) -> Response:
+    manager = server.runtime.failover
+    outcome = manager.tick(request.float_field("hours", 1.0))
+    return json_response({"outcome": outcome.as_dict(), "state": manager.state().as_dict()})
+
+
+def failover_switch(server: "Server", request: Request) -> Response:
+    manager = server.runtime.failover
+    outcome = manager.request_switch(
+        request.str_field("id"), request.str_field("reason", "manual")
+    )
+    return json_response(
+        {"outcome": outcome.as_dict(), "primary": server.runtime.cold_fans.primary()}
+    )
+
+
+def failover_window(server: "Server", request: Request) -> Response:
+    manager = server.runtime.failover
+    manager.set_window(request.int_field("start"), request.int_field("end"))
+    start, end = manager.window()
+    return json_response({"window_start": start, "window_end": end})
+
+
+def failover_policy(server: "Server", request: Request) -> Response:
+    manager = server.runtime.failover
+    rotate = request.float_field("rotate_hours", manager.rotate_hours())
+    soak = request.float_field("soak_hours", manager.soak_hours())
+    manager.set_policy(rotate, soak)
+    return json_response({"rotate_hours": rotate, "soak_hours": soak})
 
 
 def evap_state(server: "Server", request: Request) -> Response:

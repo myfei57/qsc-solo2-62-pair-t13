@@ -44,7 +44,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "failover", "evap", "rooms"},
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -61,6 +61,7 @@ class ConsoleCase(unittest.TestCase):
                 "ammonia",
                 "interlock",
                 "cold_fans",
+                "failover",
                 "evap",
                 "defrost",
                 "load",
@@ -257,6 +258,84 @@ class ConsoleCase(unittest.TestCase):
         self.assertTrue(body["above_baseline"])
         status, body = self.call("POST", "/evap/switch", {"id": "e1"})
         self.assertEqual(body["duty"], "e1")
+
+    def test_failover_routes(self) -> None:
+        self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
+        self.call("POST", "/fan/add", {"id": "f2", "role": "standby"})
+        self.call("POST", "/fan/start", {"id": "f1"})
+
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["primary"], "f1")
+        self.assertEqual(body["standbys"], ["f2"])
+        self.assertEqual(body["rotate_hours"], 720.0)
+        self.assertEqual(body["window_start"], 2)
+        self.assertEqual(body["window_end"], 4)
+
+        status, body = self.call("POST", "/fan/failover/tick", {"hours": 800.0})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["outcome"]["status"], "switched")
+        self.assertEqual(body["outcome"]["reason"], "rotate")
+        self.assertEqual(body["state"]["primary"], "f2")
+        self.assertEqual(body["state"]["runtimes"]["f1"], 800.0)
+
+        status, body = self.call("POST", "/fan/failover/switch", {"id": "f1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["primary"], "f1")
+        self.assertEqual(body["outcome"]["status"], "switched")
+
+        status, body = self.call(
+            "POST", "/fan/failover/policy", {"rotate_hours": 100.0, "soak_hours": 1.0}
+        )
+        self.assertEqual(body["rotate_hours"], 100.0)
+        status, error = self.call("POST", "/fan/failover/policy", {"rotate_hours": 0.0})
+        self.assertEqual(status, 400)
+        status, body = self.call("POST", "/fan/failover/window", {"start": 1, "end": 5})
+        self.assertEqual(body["window_start"], 1)
+        status, error = self.call("POST", "/fan/failover/window", {"start": 2, "end": 2})
+        self.assertEqual(status, 400)
+
+        status, body = self.call("POST", "/fan/fail", {"id": "f1"})
+        self.assertEqual(body["failover"]["status"], "switched")
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(body["primary"], "f2")
+        self.assertEqual(body["pending_failback"], "f1")
+        self.assertEqual(body["faults"]["f1"], 1)
+
+        status, body = self.call("POST", "/audit/filter", {"kind": "fan_switch"})
+        self.assertTrue(body["entries"])
+        status, body = self.call("POST", "/audit/filter", {"kind": "fan_airflow"})
+        self.assertTrue(body["entries"])
+
+        status, telemetry = self.call("GET", "/telemetry")
+        self.assertEqual(telemetry["failover_pending"], "f1")
+        status, snapshot = self.call("GET", "/snapshot")
+        self.assertEqual(snapshot["failover"]["primary"], "f2")
+
+    def test_failover_defrost_defers_switch(self) -> None:
+        self.add_room("r1", 1, -10.0)
+        self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
+        self.call("POST", "/fan/add", {"id": "f2", "role": "standby"})
+        self.call("POST", "/fan/start", {"id": "f1"})
+        self.call("POST", "/defrost/start", {"id": "r1"})
+
+        status, body = self.call("POST", "/fan/failover/switch", {"id": "f2"})
+        self.assertEqual(body["outcome"]["status"], "deferred")
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(body["primary"], "f1")
+        self.assertTrue(body["defrost_blocked"])
+        self.assertEqual(body["deferred"], "manual")
+
+        status, body = self.call("POST", "/fan/fail", {"id": "f1"})
+        self.assertEqual(body["failover"]["status"], "deferred")
+        status, body = self.call("GET", "/fan/failover")
+        self.assertEqual(body["primary"], "f1")
+
+        self.call("POST", "/room/reset")
+        status, body = self.call("POST", "/fan/failover/tick", {"hours": 1.0})
+        self.assertEqual(body["outcome"]["status"], "switched")
+        self.assertEqual(body["outcome"]["reason"], "fault")
+        self.assertEqual(body["state"]["primary"], "f2")
 
     def test_defrost_routes(self) -> None:
         self.add_room("r1", 1, -10.0)

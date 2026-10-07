@@ -43,6 +43,14 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "fans", "status": "warn", "detail": "no fan running"})
 
+    primary = rt.cold_fans.primary()
+    if primary and primary in rt.cold_fans.faulted_ids():
+        checks.append({"name": "failover", "status": "fail", "detail": "primary faulted"})
+    elif not rt.cold_fans.healthy_standby():
+        checks.append({"name": "failover", "status": "warn", "detail": "no healthy standby"})
+    else:
+        checks.append({"name": "failover", "status": "ok", "detail": "standby ready"})
+
     if rt.evap.temperature() > rt.evap.baseline():
         checks.append({"name": "evap", "status": "warn", "detail": "above baseline"})
     else:
